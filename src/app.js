@@ -1,10 +1,10 @@
 import express from 'express';
-import morgan from 'morgan'; // Logger de peticiones HTTP
-import cookieParser from 'cookie-parser'; // Para parsear cookies
-import 'dotenv/config'; // Carga variables de entorno
-import cors from 'cors'; // Para manejar Cross-Origin Resource Sharing
+import morgan from 'morgan';
+import cookieParser from 'cookie-parser';
+import 'dotenv/config';
+import cors from 'cors';
 
-// Importación de tus módulos de rutas
+// Importación de rutas
 import authRoutes from './user&settings/routes/auth.routes.js';
 import paymentRoutes from './user&settings/routes/payment.routes.js';
 import paypalRoutes from './user&settings/routes/paypal.routes.js';
@@ -13,126 +13,119 @@ import scrapingRoutes from './scraping/routes/partidos.scraping.routes.js';
 import scrapingRoutesLigas from './scraping/routes/ligas.scraping.routes.js';
 import googleAuthRoutes from './user&settings/routes/googleAuth.routes.js';
 
-// Configuración de Passport y sesión
-import passport from './user&settings/config/passport.js'; // Tu configuración de Passport
-import session from 'express-session'; // Para manejar sesiones
+// Configuración de Passport
+import passport from './user&settings/config/passport.js';
+import session from 'express-session';
 
-// Inicialización de la aplicación Express
 const app = express();
 
-// --- Middlewares Esenciales ---
-
-// 1. Middleware para Stripe Webhook (MUY IMPORTANTE: debe ir ANTES de express.json())
-// Stripe requiere el cuerpo de la solicitud en formato raw para verificar la firma.
-app.use('/api/stripe/webhook', express.raw({ type: 'application/json' }));
-
-// 2. Configuración de CORS (Cross-Origin Resource Sharing)
-// Define qué orígenes (dominios) pueden acceder a tu API.
+// 1. Configuración CORS mejorada
 const allowedOrigins = [
-  'http://localhost:5173',  // Frontend de desarrollo local
-  'http://localhost:3005',  // Si el backend y frontend corren en el mismo server/puerto (menos común para API)
-  // --- IMPORTANTE PARA AZURE ---
-  // Añade aquí la URL pública de tu frontend si está en un dominio diferente.
-  // Si accedes a tu API directamente desde un navegador usando la IP pública de Azure,
-  // es posible que necesites añadir esa IP o el dominio asociado.
-  // Ejemplo: 'https://tufrontend.azurewebsites.net'
-  // Ejemplo: 'http://<TU_IP_PUBLICA_AZURE>:<PUERTO_FRONTEND_SI_APLICA>'
-  'https://tudominio.com',   // Tu dominio de producción
-  // Considera añadir la IP pública de tu VM si haces pruebas directas o si alguna herramienta lo requiere.
-  // process.env.FRONTEND_URL // También puedes usar variables de entorno
-];
+  'http://localhost:5173',
+  'http://13.218.132.66:5173', // IP de tu frontend
+  'http://54.234.36.48:5173',  // IP de tu backend (por si acaso)
+  'https://tudominio.com',
+  process.env.FRONTEND_URL
+].filter(Boolean); // Elimina valores undefined
 
-app.use(cors({
+const corsOptions = {
   origin: function (origin, callback) {
-    // Permitir solicitudes sin 'origin' (ej. Postman, curl, apps móviles) Y
-    // solicitudes desde los orígenes en 'allowedOrigins'.
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      console.warn(`CORS: Origen no permitido: ${origin}`);
-      callback(new Error('No permitido por CORS'));
+    // Permitir solicitudes sin origen (como mobile apps o curl)
+    if (!origin) return callback(null, true);
+    
+    // Verificar contra la lista de orígenes permitidos
+    if (allowedOrigins.some(allowedOrigin => {
+      return origin === allowedOrigin || 
+             origin.startsWith(allowedOrigin.replace('http://', 'https://')) ||
+             new URL(origin).hostname === new URL(allowedOrigin).hostname;
+    })) {
+      return callback(null, true);
     }
+    
+    console.warn(`⚠️ Origen no permitido por CORS: ${origin}`);
+    callback(new Error('Not allowed by CORS'));
   },
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'], // Métodos HTTP permitidos
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-CSRF-Token'], // Encabezados permitidos
-  credentials: true, // ¡IMPORTANTE para enviar y recibir cookies o tokens de autorización!
-  optionsSuccessStatus: 200 // Algunos navegadores antiguos (IE11) pueden tener problemas con 204
-}));
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: [
+    'Content-Type', 
+    'Authorization', 
+    'X-Requested-With', 
+    'X-CSRF-Token',
+    'Accept',
+    'Origin'
+  ],
+  credentials: true,
+  optionsSuccessStatus: 200,
+  preflightContinue: false,
+  maxAge: 86400 // Cachear opciones CORS por 24 horas
+};
 
-// 3. Logger de peticiones HTTP (morgan)
-// 'dev' es un formato conciso y coloreado para desarrollo.
+// Aplicar CORS a todas las rutas
+app.use(cors(corsOptions));
+
+// 2. Middlewares esenciales
 app.use(morgan('dev'));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser(process.env.COOKIE_SECRET));
 
-// 4. Middleware para parsear JSON
-// Permite que Express entienda cuerpos de solicitud en formato JSON.
-app.use(express.json({ limit: '10mb' })); // Aumenta el límite si manejas JSON grandes
-
-// 5. Middleware para parsear Cookies
-// Permite acceder a `req.cookies`.
-app.use(cookieParser(process.env.COOKIE_SECRET || 'tu_super_secreto_para_cookies'));
-
-// --- Configuración de Sesión y Autenticación (Passport) ---
-// Debe ir DESPUÉS de cookieParser y ANTES de las rutas que usan autenticación.
+// 3. Configuración de sesión mejorada
 app.use(session({
-  secret: process.env.SESSION_SECRET || 'un_secreto_de_sesion_muy_fuerte', // ¡Cambia esto en producción!
-  resave: false, // No guardar la sesión si no se modificó
-  saveUninitialized: false, // No crear sesión hasta que algo se guarde
-  // store: // Considera usar un store de sesión persistente para producción (ej. connect-mongo, connect-redis)
+  secret: process.env.SESSION_SECRET || 'secret-key',
+  resave: false,
+  saveUninitialized: false,
   cookie: {
-    secure: process.env.NODE_ENV === 'production', // Usar cookies seguras (HTTPS) en producción
-    httpOnly: true, // Prevenir acceso a cookies desde JavaScript del lado del cliente
-    maxAge: 24 * 60 * 60 * 1000 // Tiempo de vida de la cookie (ej. 1 día)
-  }
+    secure: process.env.NODE_ENV === 'production',
+    httpOnly: true,
+    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+    maxAge: 24 * 60 * 60 * 1000
+  },
+  name: 'sessionId' // Nombre personalizado para la cookie
 }));
 
-app.use(passport.initialize()); // Inicializa Passport
-app.use(passport.session());    // Permite sesiones persistentes de login
+// 4. Inicializar Passport
+app.use(passport.initialize());
+app.use(passport.session());
 
-// --- Definición de Rutas de la API ---
-// Monta tus diferentes módulos de rutas bajo un prefijo común (ej. '/api').
+// 5. Rutas API
 app.use('/api', authRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/paypal', paypalRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/scraping', scrapingRoutes);
-app.use('/api/scraping', scrapingRoutesLigas); // Nota: Mismo prefijo para dos rutas de scraping. Considera diferenciarlos si es necesario.
-app.use('/api/auth', googleAuthRoutes); // Rutas específicas para autenticación con Google
+app.use('/api/scraping', scrapingRoutesLigas);
+app.use('/api/auth', googleAuthRoutes);
 
-// --- Manejo de Rutas No Encontradas (404) ---
-// Si ninguna ruta anterior coincide, esta se ejecutará.
+// 6. Middleware para manejar rutas no encontradas
 app.use((req, res, next) => {
-  res.status(404).json({ message: 'Endpoint no encontrado' });
-});
-
-// --- Manejador de Errores Global ---
-// Middleware de manejo de errores con 4 parámetros (err, req, res, next).
-// Se activará si cualquier ruta o middleware anterior llama a `next(error)`.
-app.use((err, req, res, next) => {
-  console.error("----------------------------------------");
-  console.error("Ha ocurrido un error no controlado:");
-  console.error("Ruta:", req.method, req.originalUrl);
-  if (req.body && Object.keys(req.body).length > 0) {
-    console.error("Cuerpo de la petición:", req.body);
-  }
-  console.error("Error:", err.message);
-  console.error("Stack:", err.stack);
-  console.error("----------------------------------------");
-
-  // No envíes el stack de error al cliente en producción por seguridad
-  const statusCode = err.status || err.statusCode || 500;
-  const errorMessage = process.env.NODE_ENV === 'production' && statusCode === 500
-    ? 'Error interno del servidor.'
-    : err.message || 'Ha ocurrido un error.';
-
-  res.status(statusCode).json({
-    message: errorMessage,
-    // ...(process.env.NODE_ENV !== 'production' && { stack: err.stack }) // Opcional: stack en desarrollo
+  res.status(404).json({ 
+    success: false,
+    message: 'Endpoint no encontrado',
+    path: req.originalUrl
   });
 });
 
+// 7. Manejador de errores global mejorado
+app.use((err, req, res, next) => {
+  console.error('🔥 Error:', err.stack);
+  
+  // Manejo específico para errores CORS
+  if (err.message === 'Not allowed by CORS') {
+    return res.status(403).json({
+      success: false,
+      message: 'Acceso no permitido por política CORS',
+      allowedOrigins: allowedOrigins.filter(o => o !== process.env.FRONTEND_URL)
+    });
+  }
 
-// (Opcional) Manejo explícito de OPTIONS para todas las rutas si el CORS principal no es suficiente.
-// app.options('*', cors()); // La configuración de `cors()` ya debería manejar esto.
-// Si lo habilitas, asegúrate que sea compatible con tu configuración de `cors` principal.
+  const status = err.status || 500;
+  res.status(status).json({
+    success: false,
+    message: process.env.NODE_ENV === 'production' 
+      ? 'Error interno del servidor' 
+      : err.message,
+    ...(process.env.NODE_ENV !== 'production' && { stack: err.stack })
+  });
+});
 
 export default app;

@@ -1,72 +1,122 @@
 // Importaciones necesarias
 import http from 'http';
-import app from './app.js'; // Importa la configuración de Express desde app.js
-import 'dotenv/config'; // Para cargar variables de entorno desde .env
-import { connectDB } from './db.js'; // Tu función para conectar a la base de datos
-import InitialSetup from './user&settings/schemas/initialSetup.js'; // Para configuración inicial (roles, etc.)
+import app from './app.js';
+import 'dotenv/config';
+import { connectDB } from './db.js';
+import InitialSetup from './user&settings/schemas/initialSetup.js';
 
-// Variables de entorno con valores por defecto
+// Configuración mejorada con valores por defecto
 const PROTOCOL = process.env.PROTOCOL || 'http';
-// HOST: Escuchar en '0.0.0.0' es crucial para aceptar conexiones desde CUALQUIER IP.
-// Si usas 'localhost' (127.0.0.1), solo aceptará conexiones locales desde dentro de la VM.
-const HOST = process.env.HOST || '0.0.0.0';
-const PORT = process.env.PORT || 3005; // Asegúrate que este puerto esté abierto en Azure (NSG y Firewall de la VM)
+const HOST = process.env.HOST || '0.0.0.0'; // Escucha en todas las interfaces
+const PORT = process.env.PORT || 3005;
+
+// Mejores prácticas para manejo de señales de terminación
+const shutdown = (server, signal) => {
+  console.log(`🛑 Recibida señal ${signal}, cerrando servidor...`);
+  server.close(() => {
+    console.log('✅ Servidor cerrado correctamente');
+    process.exit(0);
+  });
+
+  // Forzar cierre después de 5 segundos si no se completa
+  setTimeout(() => {
+    console.error('⚠️ Forzando cierre del servidor...');
+    process.exit(1);
+  }, 5000);
+};
 
 /**
  * @function startServer
- * @description Inicializa la conexión a la base de datos, realiza configuraciones iniciales
- * y arranca el servidor HTTP.
+ * @description Inicializa y configura el servidor HTTP con manejo mejorado de errores
  */
 const startServer = async () => {
   try {
-    // 1. Conectar a la base de datos
-    await connectDB();
-    console.log('✅ Conexión a la base de datos establecida.');
+    // 1. Conectar a la base de datos con reintentos
+    let retries = 5;
+    while (retries > 0) {
+      try {
+        await connectDB();
+        console.log('✅ Conexión a la base de datos establecida.');
+        break;
+      } catch (dbError) {
+        retries--;
+        console.error(`❌ Error al conectar a DB. Reintentos restantes: ${retries}`, dbError);
+        if (retries === 0) throw dbError;
+        await new Promise(res => setTimeout(res, 5000)); // Esperar 5 segundos
+      }
+    }
 
-    // 2. Realizar configuraciones iniciales (ej. crear roles por defecto si no existen)
-    // Es una buena práctica encapsular esto para que solo se ejecute si es necesario.
-    await InitialSetup.createRoles();
-    console.log('✅ Configuraciones iniciales verificadas/realizadas.');
+    // 2. Configuraciones iniciales con manejo de errores
+    try {
+      await InitialSetup.createRoles();
+      console.log('✅ Configuraciones iniciales completadas.');
+    } catch (setupError) {
+      console.error('⚠️ Error en configuraciones iniciales:', setupError);
+      // No es crítico, podemos continuar
+    }
 
-    // 3. Crear el servidor HTTP utilizando la aplicación Express
+    // 3. Crear servidor HTTP con timeout configurado
     const httpServer = http.createServer(app);
+    httpServer.keepAliveTimeout = 60000; // 60 segundos
+    httpServer.headersTimeout = 65000; // 65 segundos
 
-    // 4. Poner el servidor a escuchar en el HOST y PORT especificados
+    // 4. Iniciar servidor con verificación de entorno
     httpServer.listen(PORT, HOST, () => {
-      console.log(`✅ Servidor corriendo en ${PROTOCOL}://${HOST}:${PORT}`);
-      if (HOST === '0.0.0.0') {
-        console.log(`✅ El servidor es accesible desde cualquier interfaz de red en el puerto ${PORT}.`);
-        console.log(`   Para acceder desde fuera de la VM, usa la IP pública de la VM: ${PROTOCOL}://<TU_IP_PUBLICA_AZURE>:${PORT}`);
-      } else {
-        console.log(`⚠️ El servidor está configurado para escuchar solo en ${HOST}. Puede no ser accesible desde fuera.`);
+      console.log(`🚀 Servidor ${process.env.NODE_ENV || 'development'} iniciado:`);
+      console.log(`   • URL: ${PROTOCOL}://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
+      console.log(`   • Accesible externamente en: ${PROTOCOL}://<TU_IP_PUBLICA>:${PORT}`);
+      console.log(`   • Tiempo de espera: ${httpServer.keepAliveTimeout}ms`);
+      
+      if (process.env.NODE_ENV === 'development') {
+        console.log('\n🔹 Configuración CORS:');
+        console.log('   • Orígenes permitidos:', app._router.stack
+          .find(layer => layer.name === 'corsMiddleware')?.handle?.allowedOrigins || 'No configurado');
       }
     });
 
-    // Manejo de errores del servidor (opcional pero recomendado)
+    // 5. Manejo mejorado de errores del servidor
     httpServer.on('error', (error) => {
-      if (error.syscall !== 'listen') {
-        throw error;
-      }
-      // Manejar errores específicos de "listen" como puerto en uso
+      console.error('❌ Error del servidor:', error.message);
+      
       switch (error.code) {
         case 'EACCES':
-          console.error(`❌ El puerto ${PORT} requiere privilegios elevados.`);
-          process.exit(1);
+          console.error(`   → El puerto ${PORT} requiere privilegios elevados (sudo)`);
           break;
         case 'EADDRINUSE':
-          console.error(`❌ El puerto ${PORT} ya está en uso.`);
-          process.exit(1);
+          console.error(`   → El puerto ${PORT} está en uso. Intenta con otro puerto o mata el proceso:`);
+          console.error(`     Comando para Linux/Mac: lsof -i :${PORT} | grep LISTEN`);
+          console.error(`     Comando para Windows: netstat -ano | findstr :${PORT}`);
           break;
+        case 'ECONNRESET':
+          console.error('   → Conexión reseteada por el cliente');
+          return; // No es fatal
         default:
-          throw error;
+          console.error('   → Error no manejado:', error.stack);
       }
+      
+      process.exit(1);
+    });
+
+    // 6. Manejo de señales para apagado limpio
+    process.on('SIGTERM', () => shutdown(httpServer, 'SIGTERM'));
+    process.on('SIGINT', () => shutdown(httpServer, 'SIGINT'));
+    process.on('uncaughtException', (err) => {
+      console.error('⚠️ Excepción no capturada:', err);
+      shutdown(httpServer, 'uncaughtException');
+    });
+    process.on('unhandledRejection', (reason) => {
+      console.error('⚠️ Rechazo no manejado:', reason);
     });
 
   } catch (error) {
-    console.error('❌ Error al iniciar el servidor:', error);
-    process.exit(1); // Termina el proceso si hay un error crítico al iniciar
+    console.error('💥 Error crítico al iniciar el servidor:', error);
+    process.exit(1);
   }
 };
 
-// Iniciar el servidor
-startServer();
+// Iniciar el servidor con manejo de promesas no controladas
+startServer()
+  .catch(error => {
+    console.error('💣 Error no controlado en startServer:', error);
+    process.exit(1);
+  });
